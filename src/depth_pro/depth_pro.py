@@ -17,6 +17,7 @@ from torchvision.transforms import (
     ToTensor,
 )
 
+import numpy as np
 from .network.decoder import MultiresConvDecoder
 from .network.encoder import DepthProEncoder
 from .network.fov import FOVNetwork
@@ -239,6 +240,253 @@ class DepthPro(nn.Module):
             fov_deg = self.fov.forward(x, features_0.detach())
 
         return canonical_inverse_depth, fov_deg
+
+    def visualize_3d(
+        self,
+        depth: torch.Tensor,
+        rgb_image: Optional[np.ndarray] = None,
+        focallength_px: Optional[Union[float, torch.Tensor]] = None,
+        window_name: str = "DepthPro 3D Visualization"
+    ) -> None:
+        """
+        Visualize depth map as a 3D point cloud using Open3D.
+        
+        Args:
+            depth: Depth map tensor [H,W]
+            rgb_image: Optional RGB image for coloring the point cloud [H,W,3]
+            focallength_px: Focal length in pixels
+            window_name: Name for visualization window
+        """
+        import open3d as o3d
+        
+        # Convert depth and focal length to numpy
+        if isinstance(depth, torch.Tensor):
+            depth = depth.detach().cpu().numpy()
+        if isinstance(focallength_px, torch.Tensor):
+            focallength_px = focallength_px.detach().cpu().numpy()
+            
+        height, width = depth.shape
+        
+        if focallength_px is None:
+            focallength_px = width  # Rough estimate if not provided
+            
+        # Ensure focal length is a scalar
+        if hasattr(focallength_px, 'item'):
+            focallength_px = focallength_px.item()
+            
+        # Create coordinate grid
+        x_grid, y_grid = np.meshgrid(
+            np.arange(width),
+            np.arange(height)
+        )
+        
+        # Convert image coordinates to 3D points
+        Z = depth
+        X = (x_grid - width/2) * Z / focallength_px
+        Y = (y_grid - height/2) * Z / focallength_px
+        
+        # Stack coordinates
+        points = np.stack([X, Y, Z], axis=-1)
+        points = points.reshape(-1, 3)
+        
+        # Create Open3D point cloud
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        
+        # Add colors if RGB image is provided
+        if rgb_image is not None:
+            colors = rgb_image.reshape(-1, 3) / 255.0
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+            
+        # Remove invalid points
+        pcd = pcd.remove_non_finite_points()
+        
+        # Create coordinate frame for reference
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=1.0, origin=[0, 0, 0]
+        )
+        
+        # Initialize visualizer
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name=window_name)
+        
+        # Add geometry
+        vis.add_geometry(pcd)
+        vis.add_geometry(frame)
+        
+        # Set default camera view
+        ctr = vis.get_view_control()
+        ctr.set_zoom(0.8)
+        ctr.set_front([0, 0, -1])
+        ctr.set_up([0, -1, 0])
+        
+        # Run visualizer
+        vis.run()
+        vis.destroy_window()
+
+    def export_to_ply(
+        self,
+        depth: torch.Tensor,
+        rgb_image: Optional[np.ndarray] = None,
+        focallength_px: Optional[Union[float, torch.Tensor]] = None,
+        output_path: str = "output.ply",
+        voxel_size: Optional[float] = None,
+        estimate_normals: bool = True,
+        normal_radius: Optional[float] = None,
+        normal_max_nn: int = 30
+    ) -> None:
+        """
+        Export depth map as PLY file using Open3D optimization.
+        
+        Args:
+            depth: Depth map tensor [H,W]
+            rgb_image: Optional RGB image for coloring [H,W,3]
+            focallength_px: Focal length in pixels
+            output_path: Path to save the PLY file
+            voxel_size: Optional voxel size for downsampling
+            estimate_normals: Whether to estimate surface normals
+            normal_radius: Radius for normal estimation (auto if None)
+            normal_max_nn: Max neighbors for normal estimation
+        """
+        import open3d as o3d
+        
+        # Convert depth and focal length to numpy
+        if isinstance(depth, torch.Tensor):
+            depth = depth.detach().cpu().numpy()
+        if isinstance(focallength_px, torch.Tensor):
+            focallength_px = focallength_px.detach().cpu().numpy()
+            
+        height, width = depth.shape
+        
+        if focallength_px is None:
+            focallength_px = width
+            
+        # Ensure focal length is a scalar    
+        if hasattr(focallength_px, 'item'):
+            focallength_px = focallength_px.item()
+        
+        # Create Open3D intrinsic parameters
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            width=width,
+            height=height,
+            fx=focallength_px,
+            fy=focallength_px,
+            cx=width / 2,
+            cy=height / 2
+        )
+        
+        # Ensure depth is contiguous float32
+        depth = np.ascontiguousarray(depth.astype(np.float32))
+        depth_image = o3d.geometry.Image(depth)
+        
+        # Create color image if provided
+        color_image = None
+        if rgb_image is not None:
+            # Ensure RGB image is uint8 and contiguous
+            if rgb_image.dtype != np.uint8:
+                rgb_image = (rgb_image * 255).astype(np.uint8)
+            rgb_image = np.ascontiguousarray(rgb_image)
+            color_image = o3d.geometry.Image(rgb_image)
+        
+        # Convert to point cloud
+        if color_image is not None:
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                color_image,
+                depth_image,
+                depth_scale=1.0,
+                depth_trunc=np.inf,
+                convert_rgb_to_intensity=False
+            )
+            pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
+                rgbd, intrinsic
+            )
+        else:
+            pcd = o3d.geometry.PointCloud.create_from_depth_image(
+                depth_image, intrinsic
+            )
+        
+        # Remove invalid points
+        pcd = pcd.remove_non_finite_points()
+        
+        # Optionally downsample
+        if voxel_size is not None:
+            pcd = pcd.voxel_down_sample(voxel_size)
+        
+        # Estimate normals if requested
+        if estimate_normals:
+            if normal_radius is None:
+                # Estimate good radius based on point cloud density
+                bbox = pcd.get_axis_aligned_bounding_box()
+                bbox_extent = bbox.get_extent()
+                avg_extent = np.mean(bbox_extent)
+                normal_radius = avg_extent / 50  # Reasonable default
+            
+            pcd.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                    radius=normal_radius,
+                    max_nn=normal_max_nn
+                )
+            )
+            pcd.orient_normals_towards_camera_location()
+        
+        # Save as PLY
+        o3d.io.write_point_cloud(
+            output_path,
+            pcd,
+            write_ascii=False,
+            compressed=True
+        )
+        
+        return pcd  # Return point cloud for further processing if needed
+
+    def display_point_cloud(
+        self,
+        pcd,
+        window_name: str = "Point Cloud Viewer",
+        background_color: tuple = (0.1, 0.1, 0.1),
+        show_coordinate_frame: bool = True,
+        point_size: float = 1.0
+    ) -> None:
+        """
+        Display point cloud in interactive Open3D viewer.
+        
+        Args:
+            pcd: Open3D point cloud object
+            window_name: Name of the viewer window
+            background_color: RGB background color (0-1 range)
+            show_coordinate_frame: Whether to show coordinate axes
+            point_size: Size of points in visualization
+        """
+        import open3d as o3d
+        
+        # Create visualizer
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name)
+        
+        # Set rendering options
+        opt = vis.get_render_option()
+        opt.background_color = background_color
+        opt.point_size = point_size
+        
+        # Add point cloud
+        vis.add_geometry(pcd)
+        
+        # Add coordinate frame if requested
+        if show_coordinate_frame:
+            coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                size=np.mean(pcd.get_axis_aligned_bounding_box().get_extent()) * 0.2
+            )
+            vis.add_geometry(coordinate_frame)
+        
+        # Set default viewpoint
+        ctr = vis.get_view_control()
+        ctr.set_front([0, 0, -1])
+        ctr.set_up([0, -1, 0])
+        ctr.set_zoom(0.8)
+        
+        # Run visualizer
+        vis.run()
+        vis.destroy_window()
 
     @torch.no_grad()
     def infer(

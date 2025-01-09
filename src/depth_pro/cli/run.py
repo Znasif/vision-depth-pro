@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Sample script to run DepthPro.
-
-Copyright (C) 2024 Apple Inc. All Rights Reserved.
-"""
-
+"""Sample script to run DepthPro with automatic PLY output."""
 
 import argparse
 import logging
@@ -30,18 +26,67 @@ def get_torch_device() -> torch.device:
     return device
 
 
+def visualize_2d(image, depth, fig, ax_rgb, ax_disp, output_file=None):
+    """2D visualization of RGB and depth using matplotlib."""
+    # Input validation
+    if depth.min() <= 0:
+        raise ValueError("Depth values must be positive")
+    
+    # Calculate normalized inverse depth for visualization
+    inverse_depth = 1 / depth
+    max_invdepth = min(inverse_depth.max(), 1 / 0.1)  # Cap at 0.1m
+    min_invdepth = max(1 / 250, inverse_depth.min())  # Cap at 250m
+    inverse_depth_normalized = (inverse_depth - min_invdepth) / (max_invdepth - min_invdepth)
+    
+    # Display the image and estimated depth map
+    ax_rgb.clear()
+    ax_disp.clear()
+    
+    # RGB visualization
+    ax_rgb.imshow(image)
+    ax_rgb.set_title('RGB Image')
+    ax_rgb.axis('off')
+    
+    # Depth visualization
+    depth_vis = ax_disp.imshow(inverse_depth_normalized, cmap="turbo")
+    ax_disp.set_title('Depth Map')
+    ax_disp.axis('off')
+    
+    # Add colorbar
+    fig.colorbar(depth_vis, ax=ax_disp, label='Inverse Depth')
+    
+    # Save if output path provided
+    if output_file is not None:
+        # Convert to uint8 and apply colormap
+        depth_img = (inverse_depth_normalized * 255).clip(0, 255).astype(np.uint8)
+        
+        # Apply the same colormap as in the plot
+        cmap = plt.get_cmap('turbo')
+        colored_depth = (cmap(depth_img) * 255).astype(np.uint8)
+        
+        # The cmap returns RGBA, but we want RGB for JPEG
+        colored_depth_rgb = colored_depth[:, :, :3]
+        
+        PIL.Image.fromarray(colored_depth_rgb).save(str(output_file) + ".jpg", format="JPEG", quality=90)
+    
+    # Update figure
+    fig.tight_layout()
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+
 def run(args):
     """Run Depth Pro on a sample image."""
     if args.verbose:
         logging.basicConfig(level=logging.INFO)
 
-    # Load model.
+    # Load model
     model, transform = create_model_and_transforms(
         device=get_torch_device(),
         precision=torch.half,
     )
     model.eval()
 
+    # Set up input paths
     image_paths = [args.image_path]
     if args.image_path.is_dir():
         image_paths = args.image_path.glob("**/*")
@@ -49,102 +94,97 @@ def run(args):
     else:
         relative_path = args.image_path.parent
 
-    if not args.skip_display:
-        plt.ion()
-        fig = plt.figure()
-        ax_rgb = fig.add_subplot(121)
-        ax_disp = fig.add_subplot(122)
+    # Create default output directory
+    output_dir = Path("./models")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize matplotlib for visualization
+    plt.ion()
+    fig = plt.figure()
+    ax_rgb = fig.add_subplot(121)
+    ax_disp = fig.add_subplot(122)
 
     for image_path in tqdm(image_paths):
-        # Load image and focal length from exif info (if found.).
+        # Skip non-image files
+        if not image_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp']:
+            continue
+
         try:
-            LOGGER.info(f"Loading image {image_path} ...")
+            LOGGER.info(f"Processing {image_path} ...")
             image, _, f_px = load_rgb(image_path)
         except Exception as e:
-            LOGGER.error(str(e))
+            LOGGER.error(f"Error loading {image_path}: {str(e)}")
             continue
-        # Run prediction. If `f_px` is provided, it is used to estimate the final metric depth,
-        # otherwise the model estimates `f_px` to compute the depth metricness.
+            
+        # Run prediction
         prediction = model.infer(transform(image), f_px=f_px)
+        depth = prediction["depth"]
+        depth_np = depth.detach().cpu().numpy().squeeze()
 
-        # Extract the depth and focal length.
-        depth = prediction["depth"].detach().cpu().numpy().squeeze()
-        if f_px is not None:
-            LOGGER.debug(f"Focal length (from exif): {f_px:0.2f}")
-        elif prediction["focallength_px"] is not None:
-            focallength_px = prediction["focallength_px"].detach().cpu().item()
-            LOGGER.info(f"Estimated focal length: {focallength_px}")
+        # Show 2D visualization
+        rel_path = image_path.relative_to(relative_path)
+        depth_output = output_dir / rel_path.parent / image_path.stem
+        visualize_2d(image, depth_np, fig, ax_rgb, ax_disp, depth_output)
+        
+        # Create output path maintaining directory structure
+        output_path = output_dir / rel_path.parent / f"{image_path.stem}.ply"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        inverse_depth = 1 / depth
-        # Visualize inverse depth instead of depth, clipped to [0.1m;250m] range for better visualization.
-        max_invdepth_vizu = min(inverse_depth.max(), 1 / 0.1)
-        min_invdepth_vizu = max(1 / 250, inverse_depth.min())
-        inverse_depth_normalized = (inverse_depth - min_invdepth_vizu) / (
-            max_invdepth_vizu - min_invdepth_vizu
+        # Export PLY with our enhanced function
+        LOGGER.info(f"Saving PLY to: {output_path}")
+        pcd = model.export_to_ply(
+            depth=depth,
+            rgb_image=image,
+            focallength_px=prediction["focallength_px"],
+            output_path=str(output_path),
+            voxel_size=args.voxel_size,
+            estimate_normals=True
         )
 
-        # Save Depth as npz file.
-        if args.output_path is not None:
-            output_file = (
-                args.output_path
-                / image_path.relative_to(relative_path).parent
-                / image_path.stem
-            )
-            LOGGER.info(f"Saving depth map to: {str(output_file)}")
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(output_file, depth=depth)
-
-            # Save as color-mapped "turbo" jpg image.
-            cmap = plt.get_cmap("turbo")
-            color_depth = (cmap(inverse_depth_normalized)[..., :3] * 255).astype(
-                np.uint8
-            )
-            color_map_output_file = str(output_file) + ".jpg"
-            LOGGER.info(f"Saving color-mapped depth to: : {color_map_output_file}")
-            PIL.Image.fromarray(color_depth).save(
-                color_map_output_file, format="JPEG", quality=90
+        # Show 3D visualization
+        if not args.no_display:
+            LOGGER.info("Displaying point cloud...")
+            model.display_point_cloud(
+                pcd,
+                window_name=f"DepthPro - {image_path.name}",
+                point_size=2.0
             )
 
-        # Display the image and estimated depth map.
-        if not args.skip_display:
-            ax_rgb.imshow(image)
-            ax_disp.imshow(inverse_depth_normalized, cmap="turbo")
-            fig.canvas.draw()
-            fig.canvas.flush_events()
-
-    LOGGER.info("Done predicting depth!")
-    if not args.skip_display:
+    LOGGER.info("Processing complete!")
+    
+    # Keep matplotlib window open
+    if not args.no_display:
         plt.show(block=True)
 
 
 def main():
-    """Run DepthPro inference example."""
+    """Run DepthPro inference with automatic PLY export."""
     parser = argparse.ArgumentParser(
-        description="Inference scripts of DepthPro with PyTorch models."
+        description="DepthPro inference with automatic PLY export"
     )
     parser.add_argument(
         "-i", 
         "--image-path", 
         type=Path, 
         default="./data/example.jpg",
-        help="Path to input image.",
+        help="Path to input image or directory",
     )
     parser.add_argument(
-        "-o",
-        "--output-path",
-        type=Path,
-        help="Path to store output files.",
+        "--voxel-size",
+        type=float,
+        default=None,
+        help="Voxel size for point cloud downsampling (default: 0.01)",
     )
     parser.add_argument(
-        "--skip-display",
+        "--no-display",
         action="store_true",
-        help="Skip matplotlib display.",
+        help="Skip displaying visualizations",
     )
     parser.add_argument(
         "-v", 
         "--verbose", 
         action="store_true", 
-        help="Show verbose output."
+        help="Show verbose output",
     )
     
     run(parser.parse_args())
