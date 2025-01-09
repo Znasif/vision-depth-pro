@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib",
     "streamlit",
     "open3d",
+    "av",
 ]
 
 [project.scripts]
