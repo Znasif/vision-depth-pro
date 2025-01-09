@@ -1,3 +1,9 @@
 checkpoints/
 src/depth_pro.egg-info/
 *.pyc
+
+# Dependencies
+src/depth_pro/frontend/node_modules/
+
+# Production build
+src/depth_pro/frontend/dist/
