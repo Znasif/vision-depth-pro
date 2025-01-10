@@ -333,10 +333,13 @@ class DepthPro(nn.Module):
         voxel_size: Optional[float] = None,
         estimate_normals: bool = True,
         normal_radius: Optional[float] = None,
-        normal_max_nn: int = 30
+        normal_max_nn: int = 30,
+        near_threshold: float = 0.1,  # Minimum depth in meters
+        far_threshold: float = 100.0,  # Maximum depth in meters
+        depth_scale_factor: float = 0.8  # Compression factor for distant objects
     ) -> None:
         """
-        Export depth map as PLY file using Open3D optimization.
+        Export depth map as PLY file using Open3D optimization with improved handling of distant objects.
         
         Args:
             depth: Depth map tensor [H,W]
@@ -347,8 +350,12 @@ class DepthPro(nn.Module):
             estimate_normals: Whether to estimate surface normals
             normal_radius: Radius for normal estimation (auto if None)
             normal_max_nn: Max neighbors for normal estimation
+            near_threshold: Minimum depth threshold (meters)
+            far_threshold: Maximum depth threshold (meters)
+            depth_scale_factor: Factor to compress distances of far objects
         """
         import open3d as o3d
+        import numpy as np
         
         # Convert depth and focal length to numpy
         if isinstance(depth, torch.Tensor):
@@ -364,6 +371,15 @@ class DepthPro(nn.Module):
         # Ensure focal length is a scalar    
         if hasattr(focallength_px, 'item'):
             focallength_px = focallength_px.item()
+            
+        # Apply depth thresholding and scaling
+        depth = np.clip(depth, near_threshold, far_threshold)
+        
+        # Apply non-linear scaling to compress far distances while preserving near details
+        # This uses a smooth transition that preserves detail for closer objects
+        far_mask = depth > (far_threshold * 0.3)  # Start scaling at 30% of far threshold
+        depth[far_mask] = (far_threshold * 0.3) + \
+            (depth[far_mask] - far_threshold * 0.3) * depth_scale_factor
         
         # Create Open3D intrinsic parameters
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
@@ -394,7 +410,7 @@ class DepthPro(nn.Module):
                 color_image,
                 depth_image,
                 depth_scale=1.0,
-                depth_trunc=np.inf,
+                depth_trunc=far_threshold,  # Explicitly set depth truncation
                 convert_rgb_to_intensity=False
             )
             pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
@@ -408,9 +424,26 @@ class DepthPro(nn.Module):
         # Remove invalid points
         pcd = pcd.remove_non_finite_points()
         
-        # Optionally downsample
+        # Optionally downsample with adaptive voxel size
         if voxel_size is not None:
-            pcd = pcd.voxel_down_sample(voxel_size)
+            # Use smaller voxel size for closer points
+            points = np.asarray(pcd.points)
+            distances = np.linalg.norm(points, axis=1)
+            close_mask = distances < (far_threshold * 0.3)
+            
+            if np.any(close_mask):
+                # Split cloud into near and far points
+                close_pcd = pcd.select_by_index(np.where(close_mask)[0])
+                far_pcd = pcd.select_by_index(np.where(~close_mask)[0])
+                
+                # Downsample with different voxel sizes
+                close_pcd = close_pcd.voxel_down_sample(voxel_size)
+                far_pcd = far_pcd.voxel_down_sample(voxel_size * 2)  # Coarser for far points
+                
+                # Merge back
+                pcd = close_pcd + far_pcd
+            else:
+                pcd = pcd.voxel_down_sample(voxel_size)
         
         # Estimate normals if requested
         if estimate_normals:
@@ -443,7 +476,7 @@ class DepthPro(nn.Module):
         self,
         pcd,
         window_name: str = "Point Cloud Viewer",
-        background_color: tuple = (0.1, 0.1, 0.1),
+        background_color: tuple = (1, 1, 1),
         show_coordinate_frame: bool = True,
         point_size: float = 1.0
     ) -> None:
